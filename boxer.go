@@ -27,9 +27,8 @@ var (
 // so that changing a Model does not require traversing the LayoutTree.
 type Boxer struct {
 
-	// HandleMsg controls if update panics or not if its receiving a Msg
-	// this is done to make you aware that you should handle all Msg yourself
-	// except you know what the Update function does, in this case set HandleMsg to true.
+	// HandleMsg controls if updates are propagated to the currently focused bubble.
+    // And if focus message should be sent.
 	HandleMsg bool
 
 	// LayoutTree holds the root node and thus the hole LayoutTree
@@ -42,6 +41,10 @@ type Boxer struct {
 	// A valid entry can only be created with CreateLeaf,
 	// because entries without a corresponding Node in the LayoutTree are meaningless.
 	ModelMap map[string]tea.Model
+
+    // currentlyFocused keeps track of the id of the bubble currently focused
+    currentlyFocused string
+
 }
 
 // Node is a node in a layout tree or when created with CreateLeaf its a valid leave of the LayoutTree
@@ -66,34 +69,52 @@ type Node struct {
 	height int
 }
 
+type LostFocus   struct{}
+type GainedFocus struct{}
+type setFocus    struct{ ID string }
+
+func SetFocusMsg(id string) tea.Msg {
+    return setFocus{id}
+}
+
 // SizeError conveys that for at leased one node or leaf in the Layout-tree there was not enough space left
 type SizeError error
+
+// FocusError conveys that a SetFocusMsg had an incorrect ID given to it
+type FocusError setFocus
+
+func sendMsg(msg tea.Msg) tea.Cmd {
+    return func() tea.Msg { return msg }
+}
 
 // Init satisfies the tea.Model interface
 func (b Boxer) Init() tea.Cmd { return nil }
 
-// Update panics if HandleMsg is false.
-// Otherwise Update reacts to WindowSizeMsg and ctrl+c
 func (b Boxer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if !b.HandleMsg {
-		panic(fmt.Sprintf(`Received Msg: '%s'
+        panic(fmt.Sprintf(`Received Msg: '%s'
 but 'HandleMsg' was not set to true.
 
 Either handle all the Msg yourself, so that no Msg reaches this Function
 or explicitly set 'HandleMsg' to true, if you know what this does.`, msg))
+    }
+		switch msg := msg.(type) {
+    case setFocus:
+        if _, ok := b.ModelMap[msg.ID]; !ok {
+            return b, sendMsg(FocusError{ID : msg.ID})
+        }
+        cmd1 := b.updateLeaf(b.currentlyFocused, LostFocus{})
+        cmd2 := b.updateLeaf(msg.ID, LostFocus{})
+        b.currentlyFocused = msg.ID
+        return b, tea.Batch(cmd1, cmd2)
+    case tea.WindowSizeMsg:
+        cmd := b.UpdateSize(msg)
+        return b, cmd
+    default:
+        m, cmd := b.ModelMap[b.currentlyFocused].Update(msg)
+        b.ModelMap[b.currentlyFocused] = m
+        return b, cmd
 	}
-
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c":
-			return b, tea.Quit
-		}
-	case tea.WindowSizeMsg:
-		b.UpdateSize(msg)
-		return b, nil
-	}
-	return b, nil
 }
 
 // View renders the contained tea.Model's according to the LayoutTree
@@ -102,6 +123,17 @@ func (b Boxer) View() string {
 		return "waiting for size information"
 	}
 	return strings.Join(b.LayoutTree.render(b.ModelMap), NEWLINE)
+}
+
+// Utility to update currently focused bubble
+func (b *Boxer)updateLeaf(id string, msg tea.Msg) tea.Cmd {
+    m, cmd := b.ModelMap[id].Update(msg)
+    b.ModelMap[b.currentlyFocused] = m
+    return cmd
+}
+// Returns the ID of the currently focused bubble
+func (b Boxer)CurrentlyFocused() string {
+    return b.currentlyFocused
 }
 
 // render recursively renders the layout tree with the models contained in ModelMap
@@ -215,7 +247,7 @@ func (n *Node) renderHorizontal(modelMap map[string]tea.Model) []string {
 }
 
 // UpdateSize set the width and height of all Node's
-// returns SizeError if the area (width*height) is less or equal to zero for any node or leaf
+// returns SizeErrorMsg if the area (width*height) is less or equal to zero for any node or leaf
 //
 // panics if
 //   - a leaf has children
@@ -224,13 +256,13 @@ func (n *Node) renderHorizontal(modelMap map[string]tea.Model) []string {
 //
 //   - the SizeFunc returned a slice with different length compared to the size of the Children
 //   - the combined space returned by the SizeFunc is greater than the provided size
-func (b *Boxer) UpdateSize(size tea.WindowSizeMsg) error {
+func (b *Boxer) UpdateSize(size tea.WindowSizeMsg) tea.Cmd {
 	return b.LayoutTree.updateSize(size, b.ModelMap)
 }
 
 // recursive setting of the height and width according to the orientation and the SizeFunc
 // or evenly if no SizeFunc is provided
-func (n *Node) updateSize(size tea.WindowSizeMsg, modelMap map[string]tea.Model) error {
+func (n *Node) updateSize(size tea.WindowSizeMsg, modelMap map[string]tea.Model) tea.Cmd {
 	// set size before it may be reduced according to the border
 	n.width, n.height = size.Width, size.Height
 
@@ -253,7 +285,7 @@ func (n *Node) updateSize(size tea.WindowSizeMsg, modelMap map[string]tea.Model)
 		// this returns a error since it is expected that the size might change to to small
 		// and return this as a error makes it clear that it is also expected that the calling code has to change the layout
 		// according to the size-change or display an alternative message till the size is big enough again.
-		return SizeError(fmt.Errorf("not enough space for at least one node or leaf in the Layout-tree"))
+		return sendMsg(SizeError(fmt.Errorf("not enough space for at least one node or leaf in the Layout-tree")))
 	}
 
 	if n.address != "" {
@@ -266,10 +298,11 @@ func (n *Node) updateSize(size tea.WindowSizeMsg, modelMap map[string]tea.Model)
 		if !ok {
 			panic(fmt.Sprintf("no model with address '%s' found", n.address))
 		}
+        var c tea.Cmd
 		// tell model its size
-		v, _ = v.Update(tea.WindowSizeMsg{Width: size.Width, Height: size.Height})
+		v, c = v.Update(tea.WindowSizeMsg{Width: size.Width, Height: size.Height})
 		modelMap[n.address] = v
-		return nil
+		return c
 	}
 
 	// is node
@@ -297,6 +330,7 @@ func (n *Node) updateSize(size tea.WindowSizeMsg, modelMap map[string]tea.Model)
 			restWidth = 0
 		}
 
+        cmds := make([]tea.Cmd,len(n.Children))
 		for i, c := range n.Children {
 			var tmpWidth, tmpHeight int
 			if restWidth > 0 {
@@ -308,16 +342,17 @@ func (n *Node) updateSize(size tea.WindowSizeMsg, modelMap map[string]tea.Model)
 				restHeight--
 			}
 
-			c.updateSize(
+            cmd := c.updateSize(
 				tea.WindowSizeMsg{
 					Width:  width + tmpWidth,
 					Height: height + tmpHeight,
 				},
 				modelMap,
 			)
+            cmds = append(cmds, cmd)
 			n.Children[i] = c
 		}
-		return nil
+		return tea.Batch(cmds...)
 	}
 
 	// has SizeFunc so split the space according to it
@@ -331,6 +366,7 @@ func (n *Node) updateSize(size tea.WindowSizeMsg, modelMap map[string]tea.Model)
 		panic(fmt.Sprintf("SizeFunc returned %d WindowSizeMsg's but want one for each child and thus: %d", len(sizeList), len(n.Children)))
 	}
 	var heightSum, widthSum int
+    cmds := make([]tea.Cmd,len(n.Children))
 	for i, c := range n.Children {
 		// set fixed dimension
 		s := size
@@ -342,7 +378,8 @@ func (n *Node) updateSize(size tea.WindowSizeMsg, modelMap map[string]tea.Model)
 			s.Width = sizeList[i]
 		}
 
-		c.updateSize(s, modelMap)
+        cmd := c.updateSize(s, modelMap)
+        cmds = append(cmds, cmd)
 		n.Children[i] = c
 
 		// check sanity
@@ -360,7 +397,7 @@ func (n *Node) updateSize(size tea.WindowSizeMsg, modelMap map[string]tea.Model)
 	if widthSum > size.Width {
 		panic("SizeFunc spread more width than it can")
 	}
-	return nil
+	return tea.Batch(cmds...)
 }
 
 // CreateLeaf is the only way to create a Node which is treated as a Leaf in the layout-tree.
